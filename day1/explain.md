@@ -142,8 +142,8 @@ ClickHouse is organized into four layers, plus shared services underneath:
 |  |  MergeTree*  |  | Special-     |  |  Virtual     | |
 |  |  (primary,   |  | purpose      |  |  engines     | |
 |  |  LSM-based)  |  | (dictionar-  |  |  (Kafka,     | |
-|  |              |  | ies, Distri- |  |  S3, PG...)  | |
-|  |              |  | buted)       |  |              | |
+|  |  log strutured  |  | ies, Distri- |  |  S3, PG...)  | |
+|  |   merget tree  |  | buted)       |  |              | |
 |  +--------------+  +--------------+  +--------------+ |
 +----------------------------+-------------------------+
                              |
