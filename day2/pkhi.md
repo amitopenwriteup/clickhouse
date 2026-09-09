@@ -1,88 +1,99 @@
-Chalo, is doc ko Hinglish mein samjhate hain — ClickHouse ke primary key ka concept MySQL/Postgres se बिल्कुल अलग है।
+# ClickHouse Backup Setup — Hinglish mein समझें
 
-## Table Setup
+चलो, इस guide को Hinglish में समझते हैं — ClickHouse में backup disk setup करने का पूरा process, disk बनाने से लेकर restore तक।
 
-```sql
-CREATE TABLE logs (...)
-ENGINE = MergeTree()
-PARTITION BY toDate(event_time)
-ORDER BY (service, event_time);
+## 1. Backup Directory Setup
+
+```
+$ sudo mkdir -p /var/lib/clickhouse/backups
+$ sudo chown -R clickhouse:clickhouse /var/lib/clickhouse/backups
 ```
 
-यहाँ `PRIMARY KEY` explicitly नहीं दिया, तो वो automatically `ORDER BY (service, event_time)` बन जाता है।
+ये disk पे वो physical location है जहाँ ClickHouse backup archives को store करेगा। इस directory का owner `clickhouse` user होना चाहिए (या जो भी user server run करता है) — **वरना writes permission error के साथ fail हो जाएंगे**।
 
-## 1. Primary Key करता क्या है
+## 2. Config File Create करना
 
-Traditional RDBMS (MySQL/Postgres) में primary key का मतलब होता है **uniqueness** — duplicate rows allowed नहीं होते, और एक B-tree बनता है fast lookup के लिए।
-
-ClickHouse में बिल्कुल different सोच है:
-- **Uniqueness enforce नहीं होती** — same `(service, event_time)` pair multiple बार आ सकता है। Logs data के लिए ये perfectly fine है (एक ही second में multiple log entries हो सकती हैं)।
-- Primary key basically दो काम करता है: **data को disk पे sort करके रखना**, और एक **sparse index** बनाना।
-- "Sparse" का मतलब — हर row के लिए index entry नहीं बनती, बल्कि हर 8,192 rows (एक "granule") के लिए एक entry बनती है।
-
-## 2. Data Physically Store कैसे होता है
-
-- पहले `PARTITION BY toDate(event_time)` के हिसाब से data **daily partitions** में divide होता है (मतलब हर दिन का data अलग partition में)।
-- फिर हर partition के अंदर, rows को `service` के हिसाब से group करके sort किया जाता है, और **हर service के अंदर** `event_time` के हिसाब से sort होता है।
-
-मतलब data कुछ ऐसा दिखता है: पहले सारे `auth-api` के rows time-order में, फिर सारे `checkout-api` के rows time-order में, वैसे ही आगे।
-
-## 3. Sparse Index काम कैसे करता है
-
-Index में सिर्फ हर granule के **पहले row की key value** store होती है (जैसे mark 0 पे `auth-api, 00:01:02`)। जब query आती है, ClickHouse इस छोटे से index पे **binary search** करता है ये पता करने के लिए कि कौनसे granules में match हो सकता है — और सिर्फ वही disk से पढ़ता है।
-
-## 4. Query Performance Patterns
-
-### ✅ Fast — primary key efficiently use होती है
-
-```sql
-SELECT * FROM logs WHERE service = 'checkout-api';
-
-SELECT * FROM logs
-WHERE service = 'checkout-api'
-  AND event_time >= now() - INTERVAL 1 HOUR;
 ```
-Yahan ClickHouse seedha `checkout-api` वाले block पे jump kar jaata hai, फिर उसके अंदर time के हिसाब से binary search karta hai.
-
-### ⚠️ Partial benefit
-
-```sql
-SELECT * FROM logs
-WHERE event_time >= '2026-09-08 00:00:00'
-  AND event_time <  '2026-09-09 00:00:00';
-```
-Date partition key में hai isliye पूरे din skip ho jaate hain, लेकिन एक din ke andar sab services ke across scan करना padta hai.
-
-### ❌ Slow — index use नहीं हो पाती
-
-```sql
-SELECT * FROM logs WHERE event_time >= now() - INTERVAL 1 HOUR;
-
-SELECT * FROM logs WHERE status_code >= 500;
-SELECT * FROM logs WHERE level = 'ERROR';
-```
-`event_time` key का दूसरा column है, तो बिना `service` filter के binary search नहीं हो सकता। और `status_code`/`level` key में हैं ही नहीं — पूरे granule scan करने पड़ते हैं (सिर्फ date partition pruning ही help करता है).
-
-## 5. क्या यही Key Sahi Choice Hai?
-
-Ye depend karta hai aapke typical query pattern pe:
-
-| Aapki typical query | Best key choice |
-|---|---|
-| "Service X ke logs, time range Y mein" | `(service, event_time)` ← current setup ✅ |
-| "Sabhi services ke recent errors" | `(event_time)` ya `(toStartOfHour(event_time), service)` |
-| "Service X ke errors, recent pehle" | `(service, level, event_time)` |
-
-Agar aap aksar `status_code` ya `level` pe filter karte ho `service` ke bina, toh primary key change karne ke bajaay **secondary skip indexes** add karo:
-
-```sql
-ALTER TABLE logs ADD INDEX idx_status status_code TYPE minmax GRANULARITY 4;
-ALTER TABLE logs ADD INDEX idx_level  level       TYPE set(10) GRANULARITY 4;
+$ sudo nano /etc/clickhouse-server/config.d/backup_disk.xml
 ```
 
-## 6. Summary
+`config.xml` को directly edit करने से better है `config.d/` के अंदर नया file बनाना। ClickHouse startup के time इस folder के सारे files को automatically merge कर लेता है, इसलिए तुम्हारा original config clean रहता है और future में rollback भी आसान होता है।
 
-- **Primary key = sort order + sparse index**, uniqueness constraint नहीं।
-- Column का **order matters** — सिर्फ left-to-right *prefix* hi efficiently use हो sakta है `WHERE` filters mein।
-- `PARTITION BY` पूरे din prune karta hai, primary key फिर उस din ke andar granules prune karta hai।
-- Is table ke liye, `service` se scope की गई queries cheap हैं; सिर्फ `event_time` या दूसरे columns se scope की गई queries expensive हैं — apne actual query pattern ke hisaab se key order choose karo।
+## 3. Disk Register करना (`storage_configuration` के अंदर)
+
+`backup_disk.xml` में ये paste करो:
+
+```xml
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <backups>
+                <type>local</type>
+                <path>/var/lib/clickhouse/backups/</path>
+            </backups>
+        </disks>
+    </storage_configuration>
+
+    <backups>
+        <allowed_disk>backups</allowed_disk>
+        <allowed_path>/var/lib/clickhouse/backups/</allowed_path>
+    </backups>
+</clickhouse>
+```
+
+`<disks><backups>` block एक disk define करता है जिसका नाम "backups" है, और ये directory 1 में बनाई हुई directory को point करता है। `<backups><allowed_disk>` block modern ClickHouse में जरूरी है — बिना disk नाम को explicitly allowlist किए, `BACKUP ... TO Disk('backups', ...)` reject हो जाएगा, भले ही disk exist करती हो।
+
+## 4. XML Validate करना और Server Restart करना
+
+```
+$ sudo clickhouse extract-from-config --config-file /etc/clickhouse-server/config.xml --key=backups
+$ sudo service clickhouse-server restart
+```
+
+`extract-from-config` एक quick sanity check है ये confirm करने के लिए कि तुम्हारा XML well-formed है, restart करने से पहले — malformed config की वजह से server start ही नहीं हो पाएगा।
+
+## 5. Disk Visibility Confirm करना
+
+```sql
+SELECT name, path, type FROM system.disks WHERE name = 'backups';
+```
+
+तुम्हें वो path वापस दिखना चाहिए जो तुमने configure किया था। अगर table खाली है, तो मतलब config pick up नहीं हुआ — double check करो कि file `config.d/` में है और server वाकई restart हुआ (`SELECT uptime();` से confirm करो)।
+
+## 6. Test Backup लेना
+
+```sql
+BACKUP TABLE sales_db.orders TO Disk('backups', 'test_backup.zip');
+```
+
+अगर ये succeed हो जाता है, तो backup disk पूरी तरह wired up है और restore/incremental backups जैसे बाकी steps के लिए ready है।
+
+> **Note:** ClickHouse Cloud पर तुम इस तरह disks manage नहीं करते — backups platform handle करता है, और ये local-disk setup सिर्फ self-managed/on-prem clusters पर लागू होता है। Production के लिए ज़्यादातर teams disk को S3 पर point करती हैं (`<type>s3</type>` endpoint/credentials के साथ), ताकि node खोने पर भी backups सुरक्षित रहें।
+
+## 7-8. Table और Database का Full Backup
+
+```sql
+BACKUP TABLE sales_db.orders TO Disk('backups', 'orders_full_2024.zip');
+BACKUP DATABASE sales_db TO Disk('backups', 'sales_db_full.zip');
+```
+
+पहला command `orders` table का self-contained backup archive बनाता है। दूसरा पूरे schema और data के disaster-recovery के लिए useful है।
+
+## 9-11. Data Loss Simulate करके Restore Verify करना
+
+```sql
+TRUNCATE TABLE sales_db.orders;
+RESTORE TABLE sales_db.orders FROM Disk('backups', 'orders_full_2024.zip');
+SELECT count() FROM sales_db.orders;
+```
+
+पहले table को empty करो ताकि verify कर सको कि restore वाकई काम करता है। `RESTORE` command table को फिर से बनाता है और archive से उसका data reload करता है। आखिर में row count check करके confirm करो कि restore complete हुआ और कोई data loss नहीं हुआ।
+
+## 12. Incremental Backup (Optional)
+
+```sql
+BACKUP TABLE sales_db.orders TO Disk('backups', 'orders_incr.zip')
+  SETTINGS base_backup = Disk('backups', 'orders_full_2024.zip');
+```
+
+ये सिर्फ base backup के बाद हुए changes को store करता है, जिससे time और space दोनों बचते हैं।
