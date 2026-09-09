@@ -1,29 +1,27 @@
-# ClickHouse बैकअप सेटअप - हिंग्लिश एक्सप्लेनेशन
+# ClickHouse Backup Setup — Hinglish mein समझें
 
-चलिए स्टेप-बाय-स्टेप समझते हैं कि ClickHouse में बैकअप डिस्क कैसे सेटअप करते हैं।
+चलो, इस guide को Hinglish में समझते हैं — ClickHouse में backup disk setup करने का पूरा process, disk बनाने से लेकर restore तक।
 
----
+## 1. Backup Directory Setup
 
-**स्टेप 1: बैकअप रखने के लिए डायरेक्टरी बनाइए**
 ```
 $ sudo mkdir -p /var/lib/clickhouse/backups
 $ sudo chown -R clickhouse:clickhouse /var/lib/clickhouse/backups
 ```
-**एक्सप्लेनेशन:** ये डिस्क पे वो फिजिकल लोकेशन है जहाँ ClickHouse बैकअप आर्काइव्स को स्टोर करेगा। इस डायरेक्टरी का ओनर `clickhouse` यूज़र होना चाहिए (या जो भी यूज़र सर्वर रन करता है), वरना जब ClickHouse लिखने की कोशिश करेगा, परमिशन एरर आ जाएगा। यानी पहले घर बनाओ, फिर उसका ओनरशिप सही यूज़र को दो।
 
----
+ये disk पे वो physical location है जहाँ ClickHouse backup archives को store करेगा। इस directory का owner `clickhouse` user होना चाहिए (या जो भी user server run करता है) — **वरना writes permission error के साथ fail हो जाएंगे**।
 
-**स्टेप 2: कॉन्फ़िग डायरेक्टरी खोलिए नया कॉन्फ़िग फाइल ऐड करने के लिए**
+## 2. Config File Create करना
+
 ```
 $ sudo nano /etc/clickhouse-server/config.d/backup_disk.xml
 ```
-**एक्सप्लेनेशन:** `config.xml` को डायरेक्टली एडिट करने से अच्छा है कि `config.d/` के अंदर नया फाइल बनाया जाए। ClickHouse स्टार्टअप के टाइम इस फोल्डर के सारे फाइल्स को ऑटोमेटिकली मर्ज कर लेता है, इसलिए तुम्हारा ओरिजिनल कॉन्फ़िग क्लीन रहता है और फ्यूचर में रोलबैक भी आसान होता है।
 
----
+`config.xml` को directly edit करने से better है `config.d/` के अंदर नया file बनाना। ClickHouse startup के time इस folder के सारे files को automatically merge कर लेता है, इसलिए तुम्हारा original config clean रहता है और future में rollback भी आसान होता है।
 
-**स्टेप 3: `storage_configuration` के अंदर डिस्क रजिस्टर करें**
+## 3. Disk Register करना (`storage_configuration` के अंदर)
 
-`backup_disk.xml` में ये पेस्ट करो:
+`backup_disk.xml` में ये paste करो:
 
 ```xml
 <clickhouse>
@@ -43,80 +41,59 @@ $ sudo nano /etc/clickhouse-server/config.d/backup_disk.xml
 </clickhouse>
 ```
 
-**एक्सप्लेनेशन:** `<disks><backups>` ब्लॉक एक डिस्क डिफाइन करता है जिसका नाम "backups" है, और ये स्टेप 1 में बनाई हुई डायरेक्टरी को पॉइंट करता है। `<backups><allowed_disk>` ब्लॉक मॉडर्न ClickHouse में जरूरी है — बिना डिस्क नाम को एक्सप्लिसिटली अलाउलिस्ट किए, `BACKUP ... TO Disk('backups', ...)` रिजेक्ट हो जाएगा, भले ही डिस्क एक्ज़िस्ट करती हो।
+`<disks><backups>` block एक disk define करता है जिसका नाम "backups" है, और ये directory 1 में बनाई हुई directory को point करता है। `<backups><allowed_disk>` block modern ClickHouse में जरूरी है — बिना disk नाम को explicitly allowlist किए, `BACKUP ... TO Disk('backups', ...)` reject हो जाएगा, भले ही disk exist करती हो।
 
----
+## 4. XML Validate करना और Server Restart करना
 
-**स्टेप 4: XML वैलिडेट करें और सर्वर रीस्टार्ट करें**
 ```
 $ sudo clickhouse extract-from-config --config-file /etc/clickhouse-server/config.xml --key=backups
 $ sudo service clickhouse-server restart
 ```
-**एक्सप्लेनेशन:** `extract-from-config` एक क्विक सैनिटी चेक है ये कन्फर्म करने के लिए कि तुम्हारा XML वेल-फॉर्म्ड है, रीस्टार्ट करने से पहले — मैलफॉर्म्ड कॉन्फ़िग की वजह से सर्वर स्टार्ट ही नहीं हो पाएगा।
 
----
+`extract-from-config` एक quick sanity check है ये confirm करने के लिए कि तुम्हारा XML well-formed है, restart करने से पहले — malformed config की वजह से server start ही नहीं हो पाएगा।
 
-**स्टेप 5: कन्फर्म करें कि डिस्क ClickHouse को दिख रही है**
+## 5. Disk Visibility Confirm करना
+
 ```sql
 SELECT name, path, type FROM system.disks WHERE name = 'backups';
 ```
-**एक्सप्लेनेशन:** तुम्हें वो पाथ वापस दिखना चाहिए जो तुमने कॉन्फ़िगर किया था। अगर टेबल खाली है, तो मतलब कॉन्फ़िग पिक अप नहीं हुआ — डबल चेक करो कि फाइल `config.d/` में है और सर्वर वाकई रीस्टार्ट हुआ (`SELECT uptime();` से कन्फर्म करो)।
 
----
+तुम्हें वो path वापस दिखना चाहिए जो तुमने configure किया था। अगर table खाली है, तो मतलब config pick up नहीं हुआ — double check करो कि file `config.d/` में है और server वाकई restart हुआ (`SELECT uptime();` से confirm करो)।
 
-**स्टेप 6: टेस्ट बैकअप लेकर कन्फर्म करें कि डिस्क एंड-टू-एंड काम कर रही है**
+## 6. Test Backup लेना
+
 ```sql
 BACKUP TABLE sales_db.orders TO Disk('backups', 'test_backup.zip');
 ```
-**एक्सप्लेनेशन:** अगर ये सक्सेस हो जाता है, तो बैकअप डिस्क पूरी तरह वायर्ड अप है और लैब के बाकी हिस्सों (रीस्टोर, इंक्रीमेंटल बैकअप्स, वगैरह) के लिए तैयार है।
 
-**नोट:** ClickHouse Cloud पर, तुम इस तरह डिस्क मैनेज नहीं करते — बैकअप्स प्लेटफ़ॉर्म हैंडल करता है, और ये लोकल-डिस्क सेटअप सिर्फ सेल्फ-मैनेज्ड/ऑन-प्रेम क्लस्टर्स पर लागू होता है। प्रोडक्शन के लिए, ज़्यादातर टीमें डिस्क को S3 पर पॉइंट करती हैं (`<type>s3</type>` एंडपॉइंट/क्रेडेंशियल्स के साथ), ताकि नोड खोने पर भी बैकअप्स सुरक्षित रहें।
+अगर ये succeed हो जाता है, तो backup disk पूरी तरह wired up है और restore/incremental backups जैसे बाकी steps के लिए ready है।
 
----
+> **Note:** ClickHouse Cloud पर तुम इस तरह disks manage नहीं करते — backups platform handle करता है, और ये local-disk setup सिर्फ self-managed/on-prem clusters पर लागू होता है। Production के लिए ज़्यादातर teams disk को S3 पर point करती हैं (`<type>s3</type>` endpoint/credentials के साथ), ताकि node खोने पर भी backups सुरक्षित रहें।
 
-**स्टेप 7: एक टेबल का फुल बैकअप लें**
+## 7-8. Table और Database का Full Backup
+
 ```sql
 BACKUP TABLE sales_db.orders TO Disk('backups', 'orders_full_2024.zip');
-```
-**एक्सप्लेनेशन:** ये `orders` टेबल का एक सेल्फ-कंटेन्ड बैकअप आर्काइव बनाता है।
-
----
-
-**स्टेप 8: पूरे डेटाबेस का फुल बैकअप लें**
-```sql
 BACKUP DATABASE sales_db TO Disk('backups', 'sales_db_full.zip');
 ```
-**एक्सप्लेनेशन:** पूरे स्कीमा और डेटा के डिज़ास्टर-रिकवरी के लिए ये उपयोगी है।
 
----
+पहला command `orders` table का self-contained backup archive बनाता है। दूसरा पूरे schema और data के disaster-recovery के लिए useful है।
 
-**स्टेप 9: डेटा लॉस सिमुलेट करें टेबल ड्रॉप/ट्रंकेट करके**
+## 9-11. Data Loss Simulate करके Restore Verify करना
+
 ```sql
 TRUNCATE TABLE sales_db.orders;
-```
-**एक्सप्लेनेशन:** टेबल को खाली कर दो ताकि तुम वेरीफाई कर सको कि रीस्टोर वाकई काम करता है।
-
----
-
-**स्टेप 10: बैकअप से टेबल रीस्टोर करें**
-```sql
 RESTORE TABLE sales_db.orders FROM Disk('backups', 'orders_full_2024.zip');
-```
-**एक्सप्लेनेशन:** ये टेबल को फिर से बनाता है और आर्काइव से उसका डेटा रीलोड करता है।
-
----
-
-**स्टेप 11: वेरीफाई करें कि रो काउंट्स प्री-बैकअप स्टेट से मैच करते हैं**
-```sql
 SELECT count() FROM sales_db.orders;
 ```
-**एक्सप्लेनेशन:** ये कन्फर्म करता है कि रीस्टोर पूरा हुआ और कोई डेटा लॉस नहीं हुआ।
 
----
+पहले table को empty करो ताकि verify कर सको कि restore वाकई काम करता है। `RESTORE` command table को फिर से बनाता है और archive से उसका data reload करता है। आखिर में row count check करके confirm करो कि restore complete हुआ और कोई data loss नहीं हुआ।
 
-**स्टेप 12: (ऑप्शनल) एक इंक्रीमेंटल बैकअप लें**
+## 12. Incremental Backup (Optional)
+
 ```sql
 BACKUP TABLE sales_db.orders TO Disk('backups', 'orders_incr.zip')
   SETTINGS base_backup = Disk('backups', 'orders_full_2024.zip');
 ```
-**एक्सप्लेनेशन:** ये सिर्फ बेस बैकअप के बाद हुए चेंजेज़ को स्टोर करता है, जिससे टाइम और स्पेस दोनों बचते हैं।
+
+ये सिर्फ base backup के बाद हुए changes को store करता है, जिससे time और space दोनों बचते हैं।
