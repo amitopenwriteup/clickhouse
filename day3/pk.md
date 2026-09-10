@@ -1,285 +1,865 @@
-# ClickHouse में Primary Key कैसे चुनें — Hinglish में विस्तृत व्याख्या
+बिल्कुल। नीचे पूरा explanation **Hinglish में** है — यानी technical terms English में और Hindi words **देवनागरी** में।
 
-## सबसे पहले समझ लो की ClickHouse में Primary Key अलग होती है
+# ClickHouse में `ORDER BY` और `PRIMARY KEY`
 
-Traditional databases (जैसे Postgres) में primary key सिर्फ एक identifier होती है। लेकिन **ClickHouse में बिल्कुल अलग काम है**।
+Traditional RDBMS जैसे MySQL/PostgreSQL से आने वाले लोगों को ClickHouse में `ORDER BY` और `PRIMARY KEY` थोड़ा confusing लग सकता है।
 
-```
-Normal Database:        Primary Key = सिर्फ unique identifier
-ClickHouse:           Primary Key = डिस्क पर डेटा का physical order
-```
+मुख्य बात यह है कि ClickHouse के `MergeTree` tables में दोनों का काम अलग है।
 
 ---
 
-## PRIMARY KEY का असली काम क्या है?
+## 1. `ORDER BY` क्या करता है?
 
-### 1️⃣ **Data को Disk पर कैसे store करता है**
+`ORDER BY` यह define करता है कि data **disk पर किस physical order में store होगा**।
 
-ClickHouse में primary key से:
-- डेटा को **sorted order** में डिस्क पर store होता है
-- यही वजह से **compression बेहतर** होती है
-- **Queries faster** हो जाती हैं
-
-### 2️⃣ **Sparse Index बनाता है**
-
-हर block के लिए एक index entry बनता है (हर row के लिए नहीं)।
-
-```
-❌ Dense Index:  Row 1 → Row 2 → Row 3 → ... (लाखों entries)
-✅ Sparse Index: Block 1 → Block 2 → Block 3 (सैकड़ों entries)
-```
-
-### 3️⃣ **WHERE clause में तेजी**
-
-जब query में filter लगता है, तो unnecessary blocks को **skip** कर देता है।
-
----
-
-## PRIMARY KEY चुनने के 2 मुख्य नियम
-
-### नियम #1: अक्सर Filter में आने वाली columns को चुनो
+Example:
 
 ```sql
-SELECT count()
-FROM orders
-WHERE date >= '2024-01-01' AND category = 'electronics'
-```
-
-अगर ये query अक्सर चलता है, तो PRIMARY KEY में `(category, date)` रखना चाहिए।
-
-### नियम #2: Columns को सही order में arrange करो
-
-```
-RULE: Low cardinality columns पहले, फिर high cardinality
-```
-
-**Cardinality** = कितने unique values हैं।
-
-```
-PostTypeId:      8 values (Question, Answer, Wiki...)  ← Low cardinality
-CreationDate:    1000+ values                          ← High cardinality
-```
-
-**इसलिए**: `ORDER BY (PostTypeId, toDate(CreationDate))`
-
----
-
-## Real Example: Stack Overflow Posts
-
-### Scenario: "2024 के बाद कितने Questions हैं?"
-
-#### ❌ बिना Primary Key (समस्या)
-
-```sql
-CREATE TABLE posts_unordered
+CREATE TABLE logs
+(
+    user_id UInt32,
+    event_time DateTime,
+    event_type String
+)
 ENGINE = MergeTree
-ORDER BY tuple()  -- कोई PRIMARY KEY नहीं!
+ORDER BY (user_id, event_time, event_type);
 ```
 
-Query का परिणाम:
-```
-Rows Processed: 59.82 MILLION
-Time: 0.055 sec
+यहाँ ClickHouse data को इस तरह sort करके रखेगा:
+
+```text
+user_id
+   ↓
+event_time
+   ↓
+event_type
 ```
 
-**पूरी table स्कैन करनी पड़ी!** 😱
+उदाहरण:
 
-#### ✅ सही Primary Key के साथ (समाधान)
+```text
+user_id   event_time   event_type
+----------------------------------
+101       10:00        login
+101       10:05        purchase
+101       10:10        logout
+
+102       09:00        login
+102       09:20        purchase
+
+103       11:00        login
+```
+
+मतलब पहले `user_id` के according sorting होगी।
+
+फिर उसी `user_id` के अंदर `event_time` के according।
+
+फिर उसी `event_time` के अंदर `event_type` के according।
+
+### इसलिए:
+
+> **`ORDER BY` = Data disk पर किस order में रखा जाएगा।**
+
+---
+
+# 2. `PRIMARY KEY` क्या करता है?
+
+ClickHouse में `PRIMARY KEY` को देखकर traditional RDBMS जैसा मत सोचिए।
+
+MySQL/PostgreSQL में:
+
+```text
+PRIMARY KEY
+     ↓
+Unique row identification
+```
+
+लेकिन ClickHouse में:
+
+```text
+PRIMARY KEY
+     ↓
+Sparse Index
+     ↓
+Relevant data को जल्दी locate करना
+     ↓
+Unnecessary data को skip करना
+```
+
+इसलिए ClickHouse का `PRIMARY KEY` **uniqueness constraint नहीं है।**
+
+एक ही `user_id` की हजारों या लाखों rows हो सकती हैं।
+
+---
+
+# 3. Sparse Index क्या है?
+
+मान लीजिए आपकी table में **1 billion rows** हैं।
+
+अगर ClickHouse हर row के लिए index बनाए तो index बहुत बड़ा हो जाएगा।
+
+इसलिए ClickHouse हर row को index नहीं करता।
+
+Data को छोटे groups में divide किया जाता है जिन्हें **granules** कहते हैं।
+
+Simplified example:
+
+```text
+1 billion rows
+
+       ↓
+
+Granule 1
+Granule 2
+Granule 3
+Granule 4
+...
+Granule N
+```
+
+Default setting में एक granule लगभग **8192 rows** का होता है।
+
+इसलिए index कुछ ऐसा हो सकता है:
+
+```text
+Primary Index
+
+Granule 1 → key
+Granule 2 → key
+Granule 3 → key
+Granule 4 → key
+...
+```
+
+हर individual row के लिए index नहीं है।
+
+इसीलिए इसे:
+
+> **Sparse Index**
+
+कहा जाता है।
+
+---
+
+# 4. `ORDER BY` और `PRIMARY KEY` दोनों क्यों हैं?
+
+अब सबसे important सवाल।
+
+मान लीजिए:
 
 ```sql
-CREATE TABLE posts_ordered
+ORDER BY (user_id, event_time, event_type)
+PRIMARY KEY (user_id, event_time)
+```
+
+यहाँ दोनों अलग हैं।
+
+### `ORDER BY`
+
+```text
+(user_id, event_time, event_type)
+```
+
+यह पूरा sorting order define करता है।
+
+### `PRIMARY KEY`
+
+```text
+(user_id, event_time)
+```
+
+यह बताता है कि sparse primary index में कौन से columns रखे जाएँ।
+
+Visualize करो:
+
+```text
+                    TABLE DATA
+                       │
+                       │
+                       ▼
+          ORDER BY (user_id,
+                    event_time,
+                    event_type)
+                       │
+                       ▼
+              Physical sorting
+                       │
+                       │
+              ┌────────┴────────┐
+              │                 │
+              ▼                 ▼
+        Primary Key        event_type
+     (user_id,event_time)       │
+              │                 │
+              ▼                 │
+        Sparse Index            │
+              │                 │
+              └────────┬────────┘
+                       ▼
+                 Query pruning
+```
+
+---
+
+# 5. Primary Key को पूरा `ORDER BY` रखने की जरूरत क्यों नहीं?
+
+क्योंकि कभी-कभी हमें data को **ज्यादा columns पर sort** करना होता है, लेकिन index को unnecessarily बड़ा नहीं करना होता।
+
+Example:
+
+```sql
+ORDER BY (user_id, event_time, event_type)
+PRIMARY KEY (user_id, event_time)
+```
+
+Data तीन columns पर sorted है:
+
+```text
+user_id
+   ↓
+event_time
+   ↓
+event_type
+```
+
+लेकिन sparse index केवल:
+
+```text
+user_id
+   ↓
+event_time
+```
+
+पर आधारित है।
+
+इससे primary index relatively छोटा रहता है।
+
+और index memory में रखना आसान होता है।
+
+---
+
+# 6. अगर `PRIMARY KEY` specify ही नहीं किया?
+
+अगर आप लिखते हैं:
+
+```sql
+CREATE TABLE logs
+(
+    user_id UInt32,
+    event_time DateTime,
+    event_type String
+)
 ENGINE = MergeTree
-ORDER BY (PostTypeId, toDate(CreationDate))
+ORDER BY (user_id, event_time, event_type);
 ```
 
-Query का परिणाम:
-```
-Rows Processed: 196.53 THOUSAND  (पहले से 300x कम!)
-Time: 0.013 sec
+और अलग से `PRIMARY KEY` नहीं देते, तो ClickHouse सामान्यतः `ORDER BY` expression को ही primary key के रूप में use करता है।
+
+Conceptually:
+
+```sql
+ORDER BY (user_id, event_time, event_type)
+
+PRIMARY KEY (user_id, event_time, event_type)
 ```
 
-**Speed में 4x सुधार!** 🚀
+इसीलिए simple ClickHouse tables में अक्सर आपको सिर्फ:
+
+```sql
+ORDER BY (...)
+```
+
+ही दिखाई देता है।
 
 ---
 
-## Index कैसे काम करता है?
+# 7. अब देखते हैं Query कैसे तेज होती है
 
-### Sparse Index का concept
-
-```
-Index (Block headers):
-Block 1: PostTypeId=1, Date=2023-01-01
-Block 2: PostTypeId=1, Date=2023-06-01
-Block 3: PostTypeId=1, Date=2024-01-01  ← ये block खोल
-Block 4: PostTypeId=2, Date=2023-01-01  ← ये block skip
-
-Query: WHERE PostTypeId=1 AND Date >= 2024-01-01
-```
-
-- Total 7578 granules (blocks)
-- सिर्फ 39 granules को check किया
-- बाकी 7539 को **skip** कर दिया
-
----
-
-## PRIMARY KEY के 4-5 Columns कितने काफी हैं?
-
-आमतौर पर:
-
-```
-1. सबसे frequently filtered column (low cardinality)
-2. दूसरा filtered column
-3. तीसरा filtered column
-4. Grouping के लिए आने वाली column
-5. (Optional) Time-based filtering के लिए
-```
-
-**ज्यादा columns = ज्यादा overhead, कम benefit**
-
----
-
-## Important ⚠️ Gotchas
-
-### Gotcha #1: बाद में नहीं बदल सकते
+मान लीजिए:
 
 ```sql
--- ❌ ये नहीं हो सकता
-ALTER TABLE posts_ordered MODIFY ORDER BY (new_column);
-
--- ✅ सिर्फ Projections add कर सकते हो (लेकिन duplicate data)
-ALTER TABLE posts_ordered ADD PROJECTION proj_new
-AS SELECT * ORDER BY (new_column);
-```
-
-### Gotcha #2: सभी Columns को Sort करता है
-
-```sql
-ORDER BY (PostTypeId, CreationDate)
-```
-
-**मतलब**: Title, Body, Score सब भी इसी order में sorted हो जाएंगे!
-
-यही वजह है compression बेहतर है।
-
----
-
-## Step-by-Step Guide: बेस्ट PRIMARY KEY चुनने का Process
-
-### Step 1: सभी Queries को देखो
-
-```sql
--- Most common queries
-Q1: WHERE date >= '2024-01-01' AND category = 'electronics'
-Q2: WHERE user_id = 123
-Q3: SELECT sum(amount) GROUP BY category
-```
-
-### Step 2: Most selective columns पहचानो
-
-```
-date >= '2024-01-01'    ← 50% rows filter करता है (अच्छा)
-category = 'electronics' ← 20% rows filter करता है (बहुत अच्छा)
-user_id = 123           ← 0.01% rows filter करता है (बेहतरीन!)
-```
-
-### Step 3: Low-to-High cardinality में arrange करो
-
-```
-category (8 values)   ← पहले
-date (365 values)     ← फिर
-user_id (1M values)   ← आखिर में
-```
-
-### Final ORDER BY
-
-```sql
-CREATE TABLE orders
+CREATE TABLE logs
+(
+    event_time DateTime,
+    service String,
+    level String,
+    message String
+)
 ENGINE = MergeTree
-ORDER BY (category, toDate(date), user_id)
+ORDER BY (service, event_time);
 ```
+
+यहाँ implicitly:
+
+```text
+PRIMARY KEY
+(service, event_time)
+```
+
+होगा।
+
+अब table में बहुत सारा data है।
+
+क्योंकि data `service` के हिसाब से sorted है, disk पर roughly:
+
+```text
+auth
+auth
+auth
+auth
+auth
+
+payment
+payment
+payment
+payment
+payment
+
+search
+search
+search
+search
+search
+```
+
+और हर service के अंदर `event_time` भी sorted है।
 
 ---
 
-## अतिरिक्त Optimization
-
-### Tip #1: toDate() का use करो DateTime पर
+# 8. Query आती है
 
 ```sql
--- ❌ बड़ा index
-ORDER BY (CreationDate)        -- 8 bytes per value
-
--- ✅ छोटा index  
-ORDER BY (toDate(CreationDate)) -- 2 bytes per value
+SELECT *
+FROM logs
+WHERE service = 'payment';
 ```
 
-### Tip #2: Cardinality को ध्यान में रखो
+ClickHouse को पूरी table पढ़ने की जरूरत नहीं है।
 
-```
-Columns by Cardinality:
-Low:   Status (5 values), Type (10 values)
-High:  UserID (1 million), Timestamp (1 billion)
+Primary index की मदद से वह पता लगाने की कोशिश करेगा:
 
-Best: ORDER BY (Status, Type, Timestamp)
+```text
+payment data कहाँ है?
 ```
 
-### Tip #3: GROUP BY के columns को भी include करो
+फिर:
+
+```text
+auth       → SKIP
+payment    → READ
+search     → SKIP
+```
+
+मतलब:
+
+```text
+                    1 Billion Rows
+                          │
+                          ▼
+                  Sparse Primary Index
+                          │
+                          ▼
+                  Relevant Granules
+                          │
+             ┌────────────┴────────────┐
+             ▼                         ▼
+       Relevant data             Other granules
+             │                         │
+             ▼                         ▼
+           READ                       SKIP
+```
+
+यही बहुत बड़ा performance benefit है।
+
+---
+
+# 9. Granule pruning
+
+इस process को आप:
+
+**Granule Pruning**
+
+या
+
+**Index-based data skipping**
+
+के रूप में समझ सकते हैं।
+
+मतलब ClickHouse कहता है:
+
+> "मुझे पता है कि इस granule में requested data नहीं हो सकता, इसलिए इसे पढ़ने की जरूरत नहीं है।"
+
+इससे disk I/O कम होता है।
+
+---
+
+# 10. Primary Key B-Tree नहीं है
+
+यह बहुत important difference है।
+
+Traditional RDBMS:
+
+```text
+Table
+  │
+  ▼
+B-Tree Index
+  │
+  ▼
+Rows
+```
+
+ClickHouse:
+
+```text
+Table
+  │
+  ▼
+Sorted Data
+  │
+  ▼
+Sparse Primary Index
+  │
+  ▼
+Granules
+  │
+  ▼
+Selected rows
+```
+
+ClickHouse का primary index बहुत छोटा होता है क्योंकि यह हर row को index नहीं करता।
+
+---
+
+# 11. Binary Search कहाँ आता है?
+
+जब query आती है:
 
 ```sql
--- अगर ये query बहुत चलता है:
-SELECT category, sum(amount) 
-FROM orders 
-GROUP BY category
+WHERE service = 'payment'
+```
 
--- तो category को ORDER BY में रखो
-ORDER BY (category, date, user_id)
+ClickHouse अपने छोटे sparse index पर efficient searching कर सकता है।
+
+Conceptually:
+
+```text
+Sparse Index
+
+auth
+auth
+billing
+cache
+payment
+payment
+search
+search
+```
+
+ClickHouse quickly identify कर सकता है कि:
+
+```text
+payment
+   ↓
+किस range में है?
+   ↓
+कौन से granules relevant हो सकते हैं?
+```
+
+फिर सिर्फ उन्हीं granules को पढ़ता है।
+
+---
+
+# 12. Prefix बहुत important है
+
+अब सबसे important rule आता है।
+
+Suppose:
+
+```sql
+ORDER BY (service, event_time)
+```
+
+तो key का order है:
+
+```text
+1. service
+2. event_time
+```
+
+इसे ऐसे सोचो:
+
+```text
+(service, event_time)
+     │          │
+     │          └── Second
+     │
+     └───────────── First
+```
+
+### Query:
+
+```sql
+WHERE service = 'payment'
+```
+
+अच्छी है।
+
+क्यों?
+
+क्योंकि आपने **पहले column** को filter किया है।
+
+---
+
+### Query:
+
+```sql
+WHERE service = 'payment'
+AND event_time >= '2026-09-01'
+```
+
+और भी अच्छी है।
+
+क्योंकि आपने:
+
+```text
+service
+   +
+event_time
+```
+
+दोनों key columns के prefix को use किया।
+
+---
+
+# 13. लेकिन सिर्फ `event_time` filter किया तो?
+
+Query:
+
+```sql
+SELECT *
+FROM logs
+WHERE event_time >= '2026-09-01';
+```
+
+आप सोच सकते हैं:
+
+> "लेकिन `event_time` तो primary key में है, फिर ClickHouse इसका फायदा क्यों नहीं उठाएगा?"
+
+क्योंकि key है:
+
+```text
+(service, event_time)
+```
+
+और आपने पहला column छोड़ दिया।
+
+Data वास्तव में इस तरह organized है:
+
+```text
+auth
+ ├── January
+ ├── February
+ ├── March
+ └── September
+
+payment
+ ├── January
+ ├── February
+ ├── March
+ └── September
+
+search
+ ├── January
+ ├── February
+ ├── March
+ └── September
+```
+
+September का data एक single continuous range में नहीं है।
+
+इसलिए सिर्फ `event_time` से primary index उतना effective नहीं हो पाता।
+
+---
+
+# 14. इसे एक simple rule से याद रखो
+
+अगर:
+
+```sql
+ORDER BY (A, B, C)
+```
+
+तो:
+
+```text
+WHERE A = ...
+        ✅ बहुत अच्छा
+
+WHERE A = ...
+  AND B = ...
+        ✅ बहुत अच्छा
+
+WHERE A = ...
+  AND B = ...
+  AND C = ...
+        ✅ बहुत अच्छा
+
+WHERE B = ...
+        ⚠️ Primary-key pruning सीमित/कम प्रभावी
+
+WHERE C = ...
+        ⚠️ Primary-key pruning सीमित/कम प्रभावी
+```
+
+मुख्य कारण:
+
+> **ClickHouse की sparse index sorting key के left-to-right order पर निर्भर करती है।**
+
+---
+
+# 15. Column order इतना important क्यों है?
+
+मान लो आपके पास logs हैं।
+
+आपकी queries ज्यादातर ऐसी हैं:
+
+```sql
+WHERE service = 'payment'
+```
+
+तो:
+
+```sql
+ORDER BY (service, event_time)
+```
+
+अच्छा design हो सकता है।
+
+लेकिन अगर आपकी queries ज्यादातर हैं:
+
+```sql
+WHERE tenant_id = 10
+AND event_time >= ...
+```
+
+तो:
+
+```sql
+ORDER BY (tenant_id, event_time)
+```
+
+ज़्यादा natural choice हो सकती है।
+
+यानी `ORDER BY` को केवल:
+
+> "मुझे data किस order में दिखाना है"
+
+के रूप में मत सोचिए।
+
+ClickHouse में इसे ऐसे सोचिए:
+
+> **"मेरी queries data को किस dimension से ढूँढेंगी, और मुझे data को किस order में physically रखना चाहिए?"**
+
+---
+
+# 16. एक और important बात — Low Cardinality
+
+ClickHouse में `ORDER BY` design करते समय अक्सर frequently filtered columns को पहले रखने पर विचार किया जाता है।
+
+लेकिन सिर्फ:
+
+> "Low cardinality हमेशा पहले रखो"
+
+ऐसा blind rule नहीं है।
+
+असल में आपको देखना चाहिए:
+
+```text
+1. Queries किन columns पर filter करती हैं?
+2. कौन से columns prefix filtering में useful हैं?
+3. Data कितना selective होगा?
+4. Cardinality क्या है?
+5. Data distribution कैसी है?
+6. Compression/locality पर क्या असर होगा?
+```
+
+उदाहरण:
+
+```sql
+ORDER BY (tenant_id, event_time)
+```
+
+Multi-tenant application में useful हो सकता है:
+
+```text
+tenant 101
+   ↓
+   timestamps
+
+tenant 102
+   ↓
+   timestamps
+
+tenant 103
+   ↓
+   timestamps
+```
+
+और query:
+
+```sql
+WHERE tenant_id = 101
+AND event_time >= ...
+```
+
+बहुत natural access pattern बन जाता है।
+
+---
+
+# 17. पूरा flow एक बार में
+
+अब पूरे concept को एक diagram में देखो:
+
+```text
+                    INSERT DATA
+                         │
+                         ▼
+                  MergeTree Part
+                         │
+                         ▼
+               ORDER BY sorting
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+        Sorted data            Primary Key
+                                  │
+                                  ▼
+                            Sparse Index
+                                  │
+                                  ▼
+                              Granules
+                                  │
+                                  ▼
+                              WHERE query
+                                  │
+                                  ▼
+                         Index analysis
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+                    ▼                           ▼
+             Relevant granules            Other granules
+                    │                           │
+                    ▼                           ▼
+                  READ                         SKIP
+                    │
+                    ▼
+              Row filtering
+                    │
+                    ▼
+                 RESULT
 ```
 
 ---
 
-## Compression का फायदा
+# 18. सबसे आसान याद रखने वाला तरीका
 
-### Sorted Data को compress करना आसान है
+### `ORDER BY`
 
-```
-❌ Random order:
-   User 100, User 5, User 200, User 3, ...
-   (बहुत variation, कम compress)
+**"Data कहाँ और किस क्रम में रखा है?"**
 
-✅ Sorted order:
-   User 1, User 2, User 3, User 4, ...
-   (pattern दिख जाता है, ज्यादा compress)
+```text
+ORDER BY
+   ↓
+Physical sorting
 ```
 
-**Result**: 
-- कम disk space चाहिए
-- कम I/O operations
-- तेजी से queries
+### `PRIMARY KEY`
+
+**"उस sorted data को जल्दी locate करने के लिए index कहाँ लगाना है?"**
+
+```text
+PRIMARY KEY
+   ↓
+Sparse index
+   ↓
+Granule pruning
+```
+
+### `WHERE`
+
+**"मुझे कौन सा data चाहिए?"**
+
+```text
+WHERE
+   ↓
+Primary index मदद करता है
+   ↓
+Unnecessary granules skip
+   ↓
+Less data read
+   ↓
+Better performance
+```
 
 ---
 
-## Real Numbers: पहले vs बाद
+## Final example
 
-| Metric | बिना Index | सही Index |
-|--------|-----------|-----------|
-| **Rows Processed** | 59.82M | 0.196M |
-| **Bytes Processed** | 361.34 MB | 1.77 MB |
-| **Query Time** | 0.055 sec | 0.013 sec |
-| **Speed Gain** | - | **4x faster** |
+```sql
+CREATE TABLE logs
+(
+    user_id UInt32,
+    event_time DateTime,
+    event_type String,
+    message String
+)
+ENGINE = MergeTree
+ORDER BY (user_id, event_time, event_type)
+PRIMARY KEY (user_id, event_time);
+```
 
----
+इसे ऐसे पढ़ो:
 
-## निष्कर्ष (Summary)
+```text
+ORDER BY
+(user_id, event_time, event_type)
+       │          │          │
+       └──────────┴──────────┴── Data sorting
+       
+PRIMARY KEY
+(user_id, event_time)
+       │          │
+       └──────────┴──────────── Sparse index
+```
 
-✅ **PRIMARY KEY चुनते समय**:
-1. अपनी queries देखो — कौन से WHERE conditions चलते हैं?
-2. Low cardinality columns को पहले रखो
-3. High cardinality columns को बाद में रखो
-4. Time-based filtering को support करो (toDate() का use करो)
-5. एक बार बना दो — बाद में नहीं बदल सकते!
+और query:
 
-✅ **Benefits**:
-- Sparse Index तेजी से rows filter करता है
-- Data sorted रहता है, इसलिए compression बेहतर
-- Overall query performance में 4x तक सुधार
+```sql
+SELECT *
+FROM logs
+WHERE user_id = 101
+  AND event_time >= '2026-09-01';
+```
 
-🚀 **Remember**: ClickHouse का magic PRIMARY KEY से ही शुरू होता है!
+तो ClickHouse:
+
+```text
+user_id + event_time
+        ↓
+Primary sparse index
+        ↓
+Relevant granules identify
+        ↓
+बाकी granules skip
+        ↓
+केवल relevant data पढ़ना
+        ↓
+Query faster
+```
+
+**एक लाइन में पूरा ClickHouse mindset:**
+
+> **`ORDER BY` data को physically organize करता है, `PRIMARY KEY` उस organization पर sparse index देता है, और query उस index की मदद से unnecessary granules को skip कर सकती है।**
